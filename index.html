@@ -16,6 +16,7 @@
   .nav button { width:36px; height:36px; border:0; border-radius:50%; background:transparent; color:var(--ink); font:inherit; font-size:20px; cursor:pointer; }
   .nav button:hover { background:rgba(0,0,0,.08); }
   .nav button:disabled { opacity:.3; cursor:default; background:transparent; }
+  .nav button.wide { width:auto; padding:0 14px; border-radius:999px; font-size:15px; }
   .nav output { min-width:150px; text-align:center; font-variant-numeric:tabular-nums; }
   .hint { color:var(--dim); font-size:13px; padding:0 16px; text-align:center; }
   .fail { position:fixed; inset:0; display:none; place-items:center; padding:24px; text-align:center; }
@@ -29,8 +30,9 @@
     <button id="prev" aria-label="Previous page">‹</button>
     <output id="where"></output>
     <button id="next" aria-label="Next page">›</button>
+    <button id="toggle" class="wide">Open</button>
   </div>
-  <div class="hint">Click the right page to turn forward, the left page to turn back. Arrow keys work too.</div>
+  <div class="hint">Click the right page to turn forward, the left page to turn back. Press C to close or open the book.</div>
 </div>
 <div class="fail" id="fail">This book needs WebGL and an internet connection (to load three.js). Please open it in a current browser.</div>
 
@@ -148,10 +150,30 @@ const backPage  = i => 2 * i + 2;   // ...and this one once it has been turned t
 /* ------------------------------------------------------------------ *
  *  Hard cover and ground shadow
  * ------------------------------------------------------------------ */
+const T_BLOCK = 0.008 + LEAVES * LEAF_T;      // thickness of the whole page block
+const PIVOT = T_BLOCK / 2;                    // the left half swings around this height above the spine
+const BW = W + 0.08, BT = 0.03, BL = H + 0.13;
+const leftG = new THREE.Group(); leftG.position.y = PIVOT; book.add(leftG);
+const leftIn = new THREE.Group(); leftIn.position.y = -PIVOT; leftG.add(leftIn);
+
 const coverMat = new THREE.MeshStandardMaterial({ color: CONFIG.cover, roughness: 0.85 });
-const cover = new THREE.Mesh(new THREE.BoxGeometry(2 * W + 0.16, 0.03, H + 0.13), coverMat);
-cover.position.y = -0.016; cover.receiveShadow = true; cover.castShadow = true;
-book.add(cover);
+const frontMat = (() => {     // front cover: a thin foil frame, symmetric so it reads the same either way up
+  const cv = document.createElement("canvas"); cv.width = 512; cv.height = Math.round(512 * BL / BW);
+  const ctx = cv.getContext("2d"); ctx.fillStyle = CONFIG.cover; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = "#c9b27a"; ctx.lineWidth = 3; ctx.strokeRect(34, 34, cv.width - 68, cv.height - 68);
+  ctx.lineWidth = 1; ctx.strokeRect(44, 44, cv.width - 88, cv.height - 88);
+  ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cv.width / 2 - 60, cv.height / 2); ctx.lineTo(cv.width / 2 + 60, cv.height / 2); ctx.stroke();
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAniso;
+  return new THREE.MeshStandardMaterial({ map: t, roughness: 0.8 });
+})();
+function board(side, parent) {
+  const mats = Array(6).fill(coverMat); if (side < 0) mats[3] = frontMat;     // underside of the left board = front cover
+  const m = new THREE.Mesh(new THREE.BoxGeometry(BW, BT, BL), mats);
+  m.position.set(side * BW / 2, -BT / 2 - 0.001, 0); m.castShadow = m.receiveShadow = true; parent.add(m);
+}
+board(+1, book); board(-1, leftIn);
+const spine = new THREE.Mesh(new THREE.BoxGeometry(T_BLOCK + 2 * BT, BT - 0.006, BL), coverMat);
+spine.castShadow = true; book.add(spine);
 
 { // soft contact shadow under the book
   const cv = document.createElement("canvas"); cv.width = cv.height = 256;
@@ -176,7 +198,7 @@ const edgeTex = (() => {      // fine lines that read as stacked page edges
   const t = new THREE.CanvasTexture(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; return t;
 })();
 
-function makeStack(side) {    // side = +1 right, -1 left
+function makeStack(side, parent) {    // side = +1 right, -1 left
   const SX = 28;
   const top = new THREE.BufferGeometry();
   const tp = new Float32Array((SX + 1) * 2 * 3), tuv = new Float32Array((SX + 1) * 2 * 2), tidx = [];
@@ -202,17 +224,17 @@ function makeStack(side) {    // side = +1 right, -1 left
   sides.setAttribute("uv", new THREE.BufferAttribute(suv, 2)); sides.setIndex(sidx);
   const sideMesh = new THREE.Mesh(sides, new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 1, side: THREE.DoubleSide }));
   sideMesh.receiveShadow = true; sideMesh.castShadow = true;
-  book.add(topMesh, sideMesh);
+  parent.add(topMesh, sideMesh);
 
-  let lastH = -1;
+  let lastH = -1, lastF = -1;
   return {
     topMat,
     height: 0,
-    set(h) {
+    set(h, flat = 0) {
       this.height = h;
-      if (Math.abs(h - lastH) < 1e-6) return; lastH = h;
+      if (Math.abs(h - lastH) < 1e-6 && Math.abs(flat - lastF) < 1e-4) return; lastH = h; lastF = flat;
       for (let j = 0; j <= SX; j++) {
-        const u = j / SX, x = side * u * W, y = h * profile(u);
+        const u = j / SX, x = side * u * W, pr = profile(u), y = h * (pr + (1 - pr) * flat);
         tp.set([x, y, -H / 2, x, y, H / 2], j * 6);
         for (let e = 0; e < 2; e++) {
           const k = e * (SX + 1) * 2 + j * 2, z = e ? H / 2 : -H / 2;
@@ -227,7 +249,7 @@ function makeStack(side) {    // side = +1 right, -1 left
     },
   };
 }
-const stackR = makeStack(+1), stackL = makeStack(-1);
+const stackR = makeStack(+1, book), stackL = makeStack(-1, leftIn);
 const topAt = x => x >= 0 ? stackR.height * profile(Math.min(x / W, 1)) : stackL.height * profile(Math.min(-x / W, 1));
 
 /* ------------------------------------------------------------------ *
@@ -287,9 +309,12 @@ function bendLeaf(leaf, index) {
  * ------------------------------------------------------------------ */
 const nextForward = () => leaves.findIndex(l => l.goal === 0);                 // first leaf still on the right
 const nextBack = () => { for (let i = LEAVES - 1; i >= 0; i--) if (leaves[i].goal === 1) return i; return -1; };
-let hover = 0, peek = 0;                                                       // hover: +1 right page, -1 left page
+let hover = 0, peek = 0;
+let wantOpen = false, open = 0, openV = 0;                                       // open: 0 closed → 1 lying open
+const isOpen = () => wantOpen && open > 0.98;                                                       // hover: +1 right page, -1 left page
 
 function turn(dir) {
+  if (!isOpen()) return;
   const i = dir > 0 ? nextForward() : nextBack();
   if (i < 0) return;
   leaves[i].goal = dir > 0 ? 1 : 0;
@@ -306,17 +331,21 @@ function liveTextures() {
   return out;
 }
 
-const where = document.getElementById("where"), prevB = document.getElementById("prev"), nextB = document.getElementById("next");
+const where = document.getElementById("where"), prevB = document.getElementById("prev"), nextB = document.getElementById("next"), toggleB = document.getElementById("toggle");
 function updateHud() {
   const done = leaves.filter(l => l.goal === 1).length, l = done * 2, r = l + 1;
   where.textContent = done === 0 ? `Page 1 of ${CONFIG.pages}` : done === LEAVES ? `Page ${l} of ${CONFIG.pages}` : `Pages ${l}–${r} of ${CONFIG.pages}`;
-  prevB.disabled = done === 0; nextB.disabled = done === LEAVES;
+  prevB.disabled = done === 0 || !wantOpen; nextB.disabled = done === LEAVES || !wantOpen;
+  toggleB.textContent = wantOpen ? "Close" : "Open";
   history.replaceState(null, "", `#p=${l}`);
 }
 prevB.onclick = () => turn(-1); nextB.onclick = () => turn(+1);
+function setOpen(v) { wantOpen = v; hover = 0; updateHud(); }
+toggleB.onclick = () => setOpen(!wantOpen);
 addEventListener("keydown", e => {
   if (e.key === "ArrowRight" || e.key === " ") { turn(+1); e.preventDefault(); }
   if (e.key === "ArrowLeft") { turn(-1); e.preventDefault(); }
+  if (e.key === "c" || e.key === "C") setOpen(!wantOpen);
 });
 
 // pointer → which page is under the cursor, and how far the cursor is from screen centre
@@ -335,12 +364,13 @@ function pick(e) {
       peek = 0.035 + 0.075 * smooth(0.25, 1, Math.abs(hit.x) / W);   // lifts more as you near the outer edge
     }
   }
+  if (!isOpen()) { hover = 0; canvas.style.cursor = wantOpen ? "default" : "pointer"; return; }
   const can = hover > 0 ? nextForward() >= 0 : hover < 0 ? nextBack() >= 0 : false;
   canvas.style.cursor = can ? "pointer" : "default";
 }
 canvas.addEventListener("pointermove", pick);
 canvas.addEventListener("pointerleave", () => { hover = 0; mouse.inside = false; });
-canvas.addEventListener("pointerdown", e => { pick(e); if (hover) turn(hover); if (e.pointerType !== "mouse") hover = 0; });
+canvas.addEventListener("pointerdown", e => { if (!wantOpen) { setOpen(true); return; } pick(e); if (hover) turn(hover); if (e.pointerType !== "mouse") hover = 0; });
 
 /* ------------------------------------------------------------------ *
  *  Frame loop
@@ -349,16 +379,18 @@ function resize() {
   const w = innerWidth, h = innerHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
-  const dist = Math.max(3.4, 3.0 / camera.aspect + 1.2);            // step back on narrow screens
+  const dist = Math.max(4.3, 3.6 / camera.aspect + 1.2);            // step back on narrow screens
   camera.position.set(0, dist * 0.80, dist * 0.60);
-  camera.lookAt(0, 0.02, 0.06);
+  camera.lookAt(0, 0.2, 0.12);
   camera.updateProjectionMatrix();
 }
 addEventListener("resize", resize); resize();
 
+const debugO = new URLSearchParams(location.search).get("o");      // ?o=0.5 freezes the cover half open
 const debugT = new URLSearchParams(location.search).get("t");      // ?t=0.4 freezes one page mid-turn (for screenshots)
 const hashPage = parseInt((location.hash.match(/p=(\d+)/) || [])[1], 10);
 jumpTo(Number.isFinite(hashPage) ? hashPage : CONFIG.startPage);
+if (debugO !== null) { open = +debugO; wantOpen = open > 0.98; } else setTimeout(() => setOpen(true), 600);   // opens by itself on load
 
 let last = performance.now(), tiltX = 0, tiltY = 0;
 function frame(now) {
@@ -369,11 +401,12 @@ function frame(now) {
   tiltY += ((mouse.inside ? mouse.x * 0.16 : 0) - tiltY) * k;
   tiltX += ((mouse.inside ? -mouse.y * 0.09 : 0) - tiltX) * k;
   book.rotation.set(tiltX, tiltY - 0.06, 0);
+  book.position.x = -W / 2 * (1 - open);                    // a closed book sits centred
   book.updateMatrixWorld();
 
   // move every leaf towards its target with a critically damped spring
   const fwd = nextForward(), bck = nextBack();
-  let onLeft = 0, onRight = 0, used = 0;
+  let onLeft = 0, onRight = 0, used = 0, inFlight = 0;
   for (let i = 0; i < LEAVES; i++) {
     const l = leaves[i];
     let target = l.goal;
@@ -387,9 +420,22 @@ function frame(now) {
       if (Math.abs(l.t - target) < 0.0004 && Math.abs(l.v) < 0.004) { l.t = target; l.v = 0; }
       l.t = Math.min(1, Math.max(0, l.t));
     }
-    if (l.t === 0) onRight++; else if (l.t === 1) onLeft++;
+    if (l.t === 0) onRight++; else if (l.t === 1) onLeft++; else inFlight++;
   }
-  stackL.set(0.004 + onLeft * LEAF_T); stackR.set(0.004 + onRight * LEAF_T);
+
+  // cover: the left half (board + page block) swings over the right half around the spine
+  if (debugO === null) {
+    const target = wantOpen ? 1 : inFlight ? open : 0;        // wait for turning pages to land before closing
+    const omega = 2 / 0.38, x = omega * dt, e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+    const d = open - target, tmp = (openV + omega * d) * dt;
+    openV = (openV - omega * tmp) * e; open = Math.min(1, Math.max(0, target + (d + tmp) * e));
+    if (Math.abs(open - target) < 0.0005 && Math.abs(openV) < 0.005) { open = target; openV = 0; }
+  }
+  const alpha = (1 - open) * Math.PI, half = alpha / 2;
+  leftG.rotation.z = -alpha;
+  const r = (PIVOT + BT / 2) * open + (BT / 2 + 0.002) * (1 - open);
+  spine.position.set(-r * Math.sin(half), PIVOT - r * Math.cos(half), 0); spine.rotation.z = -half;
+  stackL.set(0.004 + onLeft * LEAF_T, 1 - open); stackR.set(0.004 + onRight * LEAF_T, 1 - open);
 
   // settled pages are drawn as the stack tops; pages in the air get a bending mesh
   let topLeft = -1, topRight = LEAVES;
