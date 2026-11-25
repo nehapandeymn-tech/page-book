@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blank book</title>
+<style>
+  :root { --bg-a:#ece6da; --bg-b:#cdc5b6; --ink:#2a2620; --dim:#6f685c; --chip:rgba(255,255,255,.55); }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body { background:radial-gradient(120% 90% at 50% 30%, var(--bg-a), var(--bg-b)); color:var(--ink);
+         font:15px/1.4 "Iowan Old Style", Palatino, Georgia, serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  .hud { position:fixed; left:0; right:0; bottom:20px; display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
+  .nav { display:flex; align-items:center; gap:6px; background:var(--chip); backdrop-filter:blur(8px); border-radius:999px; padding:4px; pointer-events:auto; }
+  .nav button { width:36px; height:36px; border:0; border-radius:50%; background:transparent; color:var(--ink); font:inherit; font-size:20px; cursor:pointer; }
+  .nav button:hover { background:rgba(0,0,0,.08); }
+  .nav button:disabled { opacity:.3; cursor:default; background:transparent; }
+  .nav output { min-width:150px; text-align:center; font-variant-numeric:tabular-nums; }
+  .hint { color:var(--dim); font-size:13px; padding:0 16px; text-align:center; }
+  .fail { position:fixed; inset:0; display:none; place-items:center; padding:24px; text-align:center; }
+</style>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+  <div class="nav">
+    <button id="prev" aria-label="Previous page">‹</button>
+    <output id="where"></output>
+    <button id="next" aria-label="Next page">›</button>
+  </div>
+  <div class="hint">Click the right page to turn forward, the left page to turn back. Arrow keys work too.</div>
+</div>
+<div class="fail" id="fail">This book needs WebGL and an internet connection (to load three.js). Please open it in a current browser.</div>
+
+<script type="module">
+import * as THREE from "three";
+
+/* ------------------------------------------------------------------ *
+ *  Settings you are likely to change
+ * ------------------------------------------------------------------ */
+const CONFIG = {
+  pages: 300,              // total numbered pages (even number)
+  startPage: 150,          // page shown on the left when the book opens (overridden by #p=NN in the URL)
+  // To use scanned pages later, return an image path for page n, e.g.
+  //   pageImage: n => `pages/${String(n).padStart(3, "0")}.jpg`
+  // Any page whose image is missing falls back to the blank numbered page.
+  // (Images only load when the folder is served over http, not opened as a file.)
+  pageImage: null,
+  paper: "#f4eedf",
+  ink: "#4a4337",
+  cover: "#1f3a34",
+};
+
+const W = 1.0, H = 1.42;            // page width / height in scene units
+const LEAVES = CONFIG.pages / 2;    // one leaf = two pages (front and back)
+const LEAF_T = 0.0017;              // thickness of one leaf in the page block
+const NX = 36;                      // bend resolution of a turning page
+const GUTTER = 0.2;                 // share of the page width that curves down into the spine
+
+/* ------------------------------------------------------------------ *
+ *  Renderer, scene, camera, light
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById("c");
+let renderer;
+try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true }); }
+catch (e) { document.getElementById("fail").style.display = "grid"; throw e; }
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 50);
+
+scene.add(new THREE.HemisphereLight(0xfff6e6, 0x8c8474, 1.15));
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.1);
+sun.position.set(-1.6, 3.2, 1.4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -1.6, right: 1.6, top: 1.4, bottom: -1.4, near: 0.5, far: 8 });
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.012; sun.shadow.radius = 5;
+scene.add(sun);
+
+const book = new THREE.Group();
+scene.add(book);
+
+/* ------------------------------------------------------------------ *
+ *  Page textures: blank paper + page number, or a scan if provided
+ * ------------------------------------------------------------------ */
+const TEX_W = 640, TEX_H = Math.round(640 * H / W);
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+const texCache = new Map();
+
+function paintBlank(ctx, n) {
+  const numbered = n >= 1 && n <= CONFIG.pages;
+  ctx.fillStyle = numbered ? CONFIG.paper : "#d9cdb4";       // endpaper when the block runs out
+  ctx.fillRect(0, 0, TEX_W, TEX_H);
+  // paper grain
+  const img = ctx.getImageData(0, 0, TEX_W, TEX_H), d = img.data;
+  let seed = n * 9301 + 49297;
+  for (let i = 0; i < d.length; i += 4) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const g = ((seed >> 16) & 15) - 7.5;
+    d[i] += g; d[i + 1] += g; d[i + 2] += g * 0.9;
+  }
+  ctx.putImageData(img, 0, 0);
+  if (!numbered) return;
+  ctx.fillStyle = CONFIG.ink;
+  ctx.font = `500 ${Math.round(TEX_W * 0.034)}px "Iowan Old Style", Palatino, Georgia, serif`;
+  ctx.textBaseline = "alphabetic";
+  const odd = n % 2 === 1;                                    // odd pages sit on the right
+  ctx.textAlign = odd ? "right" : "left";
+  ctx.fillText(String(n), odd ? TEX_W * 0.88 : TEX_W * 0.12, TEX_H * 0.94);
+}
+
+function shadeGutter(ctx, n) {
+  // soft darkening towards the spine edge of the page
+  const odd = n % 2 === 1, x0 = odd ? 0 : TEX_W, x1 = odd ? TEX_W * 0.22 : TEX_W * 0.78;
+  const g = ctx.createLinearGradient(x0, 0, x1, 0);
+  g.addColorStop(0, "rgba(60,48,30,.34)"); g.addColorStop(0.35, "rgba(60,48,30,.10)"); g.addColorStop(1, "rgba(60,48,30,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, TEX_W, TEX_H);
+}
+
+function pageTexture(n) {
+  if (texCache.has(n)) { const t = texCache.get(n); texCache.delete(n); texCache.set(n, t); return t; }
+  const cv = document.createElement("canvas"); cv.width = TEX_W; cv.height = TEX_H;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  paintBlank(ctx, n); shadeGutter(ctx, n);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAniso;
+  texCache.set(n, tex);
+  const src = CONFIG.pageImage && n >= 1 && n <= CONFIG.pages ? CONFIG.pageImage(n) : null;
+  if (src) {
+    const im = new Image(); im.crossOrigin = "anonymous";
+    im.onload = () => { ctx.drawImage(im, 0, 0, TEX_W, TEX_H); shadeGutter(ctx, n); tex.needsUpdate = true; };
+    im.src = src;
+  }
+  if (texCache.size > 40) {                                   // keep GPU memory bounded
+    const inUse = new Set(liveTextures());
+    for (const [k, t] of texCache) { if (texCache.size <= 28) break; if (!inUse.has(t)) { t.dispose(); texCache.delete(k); } }
+  }
+  return tex;
+}
+const frontPage = i => 2 * i + 1;   // leaf i shows this page while it lies on the right
+const backPage  = i => 2 * i + 2;   // ...and this one once it has been turned to the left
+
+/* ------------------------------------------------------------------ *
+ *  Hard cover and ground shadow
+ * ------------------------------------------------------------------ */
+const coverMat = new THREE.MeshStandardMaterial({ color: CONFIG.cover, roughness: 0.85 });
+const cover = new THREE.Mesh(new THREE.BoxGeometry(2 * W + 0.16, 0.03, H + 0.13), coverMat);
+cover.position.y = -0.016; cover.receiveShadow = true; cover.castShadow = true;
+book.add(cover);
+
+{ // soft contact shadow under the book
+  const cv = document.createElement("canvas"); cv.width = cv.height = 256;
+  const ctx = cv.getContext("2d"), g = ctx.createRadialGradient(128, 128, 20, 128, 128, 128);
+  g.addColorStop(0, "rgba(40,30,15,.55)"); g.addColorStop(0.55, "rgba(40,30,15,.22)"); g.addColorStop(1, "rgba(40,30,15,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 256);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 2.7),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false }));
+  m.rotation.x = -Math.PI / 2; m.position.set(0.08, -0.05, 0.1);
+  book.add(m);
+}
+
+/* ------------------------------------------------------------------ *
+ *  The two page blocks (left and right stacks)
+ * ------------------------------------------------------------------ */
+const profile = u => { const k = Math.min(u / GUTTER, 1); return 1 - (1 - k) * (1 - k); };  // 0 at spine → 1
+
+const edgeTex = (() => {      // fine lines that read as stacked page edges
+  const cv = document.createElement("canvas"); cv.width = 8; cv.height = 64;
+  const ctx = cv.getContext("2d"); ctx.fillStyle = "#e9e1cf"; ctx.fillRect(0, 0, 8, 64);
+  for (let y = 0; y < 64; y += 2) { ctx.fillStyle = `rgba(90,75,50,${0.10 + (y % 6) * 0.03})`; ctx.fillRect(0, y, 8, 1); }
+  const t = new THREE.CanvasTexture(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; return t;
+})();
+
+function makeStack(side) {    // side = +1 right, -1 left
+  const SX = 28;
+  const top = new THREE.BufferGeometry();
+  const tp = new Float32Array((SX + 1) * 2 * 3), tuv = new Float32Array((SX + 1) * 2 * 2), tidx = [];
+  for (let j = 0; j <= SX; j++) {
+    const u = j / SX;
+    for (let r = 0; r < 2; r++) { const k = j * 2 + r; tuv[k * 2] = side > 0 ? u : 1 - u; tuv[k * 2 + 1] = r ? 0 : 1; }
+    if (j < SX) { const a = j * 2, b = a + 1, c = a + 2, d = a + 3; side > 0 ? tidx.push(a, b, c, b, d, c) : tidx.push(a, c, b, b, c, d); }
+  }
+  top.setAttribute("position", new THREE.BufferAttribute(tp, 3));
+  top.setAttribute("uv", new THREE.BufferAttribute(tuv, 2)); top.setIndex(tidx);
+  const topMat = new THREE.MeshStandardMaterial({ roughness: 0.95 });
+  const topMesh = new THREE.Mesh(top, topMat); topMesh.receiveShadow = true;
+
+  // sides: near edge, far edge, outer edge
+  const sides = new THREE.BufferGeometry();
+  const sp = new Float32Array(((SX + 1) * 4 + 4) * 3), suv = new Float32Array(((SX + 1) * 4 + 4) * 2), sidx = [];
+  for (let e = 0; e < 2; e++) for (let j = 0; j < SX; j++) {
+    const a = e * (SX + 1) * 2 + j * 2, b = a + 1, c = a + 2, d = a + 3;
+    ((e === 0) === (side > 0)) ? sidx.push(a, c, b, b, c, d) : sidx.push(a, b, c, b, d, c);
+  }
+  const o = (SX + 1) * 4; side > 0 ? sidx.push(o, o + 1, o + 2, o + 1, o + 3, o + 2) : sidx.push(o, o + 2, o + 1, o + 1, o + 2, o + 3);
+  sides.setAttribute("position", new THREE.BufferAttribute(sp, 3));
+  sides.setAttribute("uv", new THREE.BufferAttribute(suv, 2)); sides.setIndex(sidx);
+  const sideMesh = new THREE.Mesh(sides, new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 1, side: THREE.DoubleSide }));
+  sideMesh.receiveShadow = true; sideMesh.castShadow = true;
+  book.add(topMesh, sideMesh);
+
+  let lastH = -1;
+  return {
+    topMat,
+    height: 0,
+    set(h) {
+      this.height = h;
+      if (Math.abs(h - lastH) < 1e-6) return; lastH = h;
+      for (let j = 0; j <= SX; j++) {
+        const u = j / SX, x = side * u * W, y = h * profile(u);
+        tp.set([x, y, -H / 2, x, y, H / 2], j * 6);
+        for (let e = 0; e < 2; e++) {
+          const k = e * (SX + 1) * 2 + j * 2, z = e ? H / 2 : -H / 2;
+          sp.set([x, 0, z, x, y, z], k * 3); suv.set([u * 6, 0, u * 6, y * 60], k * 2);
+        }
+      }
+      const x = side * W, k = (SX + 1) * 4;
+      sp.set([x, 0, -H / 2, x, h, -H / 2, x, 0, H / 2, x, h, H / 2], k * 3);
+      suv.set([0, 0, 0, h * 60, 8, 0, 8, h * 60], k * 2);
+      for (const g of [top, sides]) { g.attributes.position.needsUpdate = true; g.computeVertexNormals(); g.computeBoundingSphere(); }
+      sides.attributes.uv.needsUpdate = true;
+    },
+  };
+}
+const stackR = makeStack(+1), stackL = makeStack(-1);
+const topAt = x => x >= 0 ? stackR.height * profile(Math.min(x / W, 1)) : stackL.height * profile(Math.min(-x / W, 1));
+
+/* ------------------------------------------------------------------ *
+ *  Turning pages. Each leaf has t: 0 = lying on the right, 1 = lying on the left.
+ * ------------------------------------------------------------------ */
+const smooth = (a, b, x) => { const k = Math.min(Math.max((x - a) / (b - a), 0), 1); return k * k * (3 - 2 * k); };
+
+function makeLeafMesh() {
+  const n = (NX + 1) * 2;
+  const pos = new THREE.BufferAttribute(new Float32Array(n * 3), 3);
+  const uvF = new Float32Array(n * 2), uvB = new Float32Array(n * 2), idx = [];
+  for (let j = 0; j <= NX; j++) for (let r = 0; r < 2; r++) {
+    const k = j * 2 + r, u = j / NX;
+    uvF[k * 2] = u; uvB[k * 2] = 1 - u; uvF[k * 2 + 1] = uvB[k * 2 + 1] = r ? 0 : 1;
+    if (r === 0 && j < NX) idx.push(k, k + 1, k + 2, k + 1, k + 3, k + 2);
+  }
+  const gF = new THREE.BufferGeometry(), gB = new THREE.BufferGeometry();
+  gF.setAttribute("position", pos); gF.setAttribute("uv", new THREE.BufferAttribute(uvF, 2)); gF.setIndex(idx);
+  gF.computeVertexNormals();
+  gB.setAttribute("position", pos); gB.setAttribute("uv", new THREE.BufferAttribute(uvB, 2)); gB.setIndex(idx);
+  gB.setAttribute("normal", gF.attributes.normal);
+  const front = new THREE.Mesh(gF, new THREE.MeshStandardMaterial({ roughness: 0.95, side: THREE.FrontSide, shadowSide: THREE.DoubleSide }));
+  const back  = new THREE.Mesh(gB, new THREE.MeshStandardMaterial({ roughness: 0.95, side: THREE.BackSide }));
+  front.castShadow = front.receiveShadow = back.receiveShadow = true;
+  front.frustumCulled = back.frustumCulled = false;
+  const g = new THREE.Group(); g.add(front, back); g.visible = false; book.add(g);
+  return { g, gF, pos, front, back };
+}
+const pool = [];
+const leaves = Array.from({ length: LEAVES }, () => ({ t: 0, v: 0, goal: 0, mesh: null }));
+
+function bendLeaf(leaf, index) {
+  const { t, v } = leaf, a = leaf.mesh.pos.array;
+  const theta = t * Math.PI;
+  const mid = smooth(0, 0.3, Math.min(t, 1 - t));           // 0 while peeling off a stack, 1 in mid-turn
+  const lag = Math.max(-1, Math.min(1, v / 2.2)) * 0.95 * Math.sin(theta);   // outer edge trails the motion
+  const ds = W / NX, lift = 0.0012 + index * 0.00001;
+  let x = 0, y = 0;
+  for (let j = 0; j <= NX; j++) {
+    const u = j / NX;
+    if (j > 0) {
+      const um = (j - 0.5) / NX, shape = (2.4 * um * um) * (1 - mid) + mid;     // the free edge lifts first
+      let phi = t <= 0.5 ? theta * shape : Math.PI - (Math.PI - theta) * shape;
+      phi = Math.max(-0.06, Math.min(Math.PI + 0.06, phi - lag * um));
+      x += Math.cos(phi) * ds; y += Math.sin(phi) * ds;
+    }
+    const yy = Math.max(y, 0) + topAt(x) + lift;
+    a[j * 6] = x; a[j * 6 + 1] = yy; a[j * 6 + 2] = -H / 2;
+    a[j * 6 + 3] = x; a[j * 6 + 4] = yy; a[j * 6 + 5] = H / 2;
+  }
+  leaf.mesh.pos.needsUpdate = true;
+  leaf.mesh.gF.computeVertexNormals();
+}
+
+/* ------------------------------------------------------------------ *
+ *  State: which leaf turns next, hover peek, clicks
+ * ------------------------------------------------------------------ */
+const nextForward = () => leaves.findIndex(l => l.goal === 0);                 // first leaf still on the right
+const nextBack = () => { for (let i = LEAVES - 1; i >= 0; i--) if (leaves[i].goal === 1) return i; return -1; };
+let hover = 0, peek = 0;                                                       // hover: +1 right page, -1 left page
+
+function turn(dir) {
+  const i = dir > 0 ? nextForward() : nextBack();
+  if (i < 0) return;
+  leaves[i].goal = dir > 0 ? 1 : 0;
+  updateHud();
+}
+function jumpTo(page) {
+  const done = Math.max(0, Math.min(LEAVES, Math.round(page / 2)));
+  leaves.forEach((l, i) => { l.goal = l.t = i < done ? 1 : 0; l.v = 0; });
+  updateHud();
+}
+function liveTextures() {
+  const out = [stackL.topMat.map, stackR.topMat.map];
+  for (const p of pool) out.push(p.front.material.map, p.back.material.map);
+  return out;
+}
+
+const where = document.getElementById("where"), prevB = document.getElementById("prev"), nextB = document.getElementById("next");
+function updateHud() {
+  const done = leaves.filter(l => l.goal === 1).length, l = done * 2, r = l + 1;
+  where.textContent = done === 0 ? `Page 1 of ${CONFIG.pages}` : done === LEAVES ? `Page ${l} of ${CONFIG.pages}` : `Pages ${l}–${r} of ${CONFIG.pages}`;
+  prevB.disabled = done === 0; nextB.disabled = done === LEAVES;
+  history.replaceState(null, "", `#p=${l}`);
+}
+prevB.onclick = () => turn(-1); nextB.onclick = () => turn(+1);
+addEventListener("keydown", e => {
+  if (e.key === "ArrowRight" || e.key === " ") { turn(+1); e.preventDefault(); }
+  if (e.key === "ArrowLeft") { turn(-1); e.preventDefault(); }
+});
+
+// pointer → which page is under the cursor, and how far the cursor is from screen centre
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), mouse = { x: 0, y: 0, inside: false };
+const plane = new THREE.Plane(), hit = new THREE.Vector3(), inv = new THREE.Matrix4();
+function pick(e) {
+  ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  mouse.x = ndc.x; mouse.y = ndc.y; mouse.inside = true;
+  ray.setFromCamera(ndc, camera);
+  plane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0).transformDirection(book.matrixWorld), book.getWorldPosition(new THREE.Vector3()));
+  hover = 0; peek = 0;
+  if (ray.ray.intersectPlane(plane, hit)) {
+    hit.applyMatrix4(inv.copy(book.matrixWorld).invert());
+    if (Math.abs(hit.x) <= W + 0.04 && Math.abs(hit.z) <= H / 2 + 0.04) {
+      hover = hit.x >= 0 ? 1 : -1;
+      peek = 0.035 + 0.075 * smooth(0.25, 1, Math.abs(hit.x) / W);   // lifts more as you near the outer edge
+    }
+  }
+  const can = hover > 0 ? nextForward() >= 0 : hover < 0 ? nextBack() >= 0 : false;
+  canvas.style.cursor = can ? "pointer" : "default";
+}
+canvas.addEventListener("pointermove", pick);
+canvas.addEventListener("pointerleave", () => { hover = 0; mouse.inside = false; });
+canvas.addEventListener("pointerdown", e => { pick(e); if (hover) turn(hover); if (e.pointerType !== "mouse") hover = 0; });
+
+/* ------------------------------------------------------------------ *
+ *  Frame loop
+ * ------------------------------------------------------------------ */
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  const dist = Math.max(3.4, 3.0 / camera.aspect + 1.2);            // step back on narrow screens
+  camera.position.set(0, dist * 0.80, dist * 0.60);
+  camera.lookAt(0, 0.02, 0.06);
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize); resize();
+
+const debugT = new URLSearchParams(location.search).get("t");      // ?t=0.4 freezes one page mid-turn (for screenshots)
+const hashPage = parseInt((location.hash.match(/p=(\d+)/) || [])[1], 10);
+jumpTo(Number.isFinite(hashPage) ? hashPage : CONFIG.startPage);
+
+let last = performance.now(), tiltX = 0, tiltY = 0;
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+
+  // the whole book leans gently towards the cursor
+  const k = 1 - Math.exp(-dt * 5);
+  tiltY += ((mouse.inside ? mouse.x * 0.16 : 0) - tiltY) * k;
+  tiltX += ((mouse.inside ? -mouse.y * 0.09 : 0) - tiltX) * k;
+  book.rotation.set(tiltX, tiltY - 0.06, 0);
+  book.updateMatrixWorld();
+
+  // move every leaf towards its target with a critically damped spring
+  const fwd = nextForward(), bck = nextBack();
+  let onLeft = 0, onRight = 0, used = 0;
+  for (let i = 0; i < LEAVES; i++) {
+    const l = leaves[i];
+    let target = l.goal;
+    if (hover > 0 && i === fwd) target = peek;
+    if (hover < 0 && i === bck) target = 1 - peek;
+    if (debugT !== null && i === fwd) { l.t = +debugT; l.v = 1.2; target = l.t; }
+    if (l.t !== target || l.v !== 0) {
+      const omega = 2 / (Math.abs(target - l.goal) > 0 ? 0.16 : 0.27), x = omega * dt;
+      const e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x), d = l.t - target, tmp = (l.v + omega * d) * dt;
+      if (debugT === null) { l.v = (l.v - omega * tmp) * e; l.t = target + (d + tmp) * e; }
+      if (Math.abs(l.t - target) < 0.0004 && Math.abs(l.v) < 0.004) { l.t = target; l.v = 0; }
+      l.t = Math.min(1, Math.max(0, l.t));
+    }
+    if (l.t === 0) onRight++; else if (l.t === 1) onLeft++;
+  }
+  stackL.set(0.004 + onLeft * LEAF_T); stackR.set(0.004 + onRight * LEAF_T);
+
+  // settled pages are drawn as the stack tops; pages in the air get a bending mesh
+  let topLeft = -1, topRight = LEAVES;
+  for (let i = 0; i < LEAVES; i++) { if (leaves[i].t === 1) topLeft = i; }
+  for (let i = LEAVES - 1; i >= 0; i--) { if (leaves[i].t === 0) topRight = i; }
+  stackL.topMat.map = pageTexture(topLeft < 0 ? 0 : backPage(topLeft));
+  stackR.topMat.map = pageTexture(topRight >= LEAVES ? CONFIG.pages + 1 : frontPage(topRight));
+  for (let i = 0; i < LEAVES; i++) {
+    const l = leaves[i];
+    if (l.t === 0 || l.t === 1) { l.mesh = null; continue; }
+    const m = pool[used] || (pool[used] = makeLeafMesh()); used++;
+    l.mesh = m; m.g.visible = true;
+    m.front.material.map = pageTexture(frontPage(i)); m.back.material.map = pageTexture(backPage(i));
+    bendLeaf(l, i);
+  }
+  for (let i = used; i < pool.length; i++) pool[i].g.visible = false;
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
